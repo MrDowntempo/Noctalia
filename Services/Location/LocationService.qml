@@ -10,8 +10,19 @@ Singleton {
   id: root
 
   property string locationFile: Quickshell.env("NOCTALIA_WEATHER_FILE") || (Settings.cacheDir + "location.json")
-  property int weatherUpdateFrequency: 30 * 60 // 30 minutes expressed in seconds
+  property int weatherUpdateFrequency: 30 * 60
   property bool isFetchingWeather: false
+
+  // Talia weather
+  readonly property int taliaMascotWeatherMonth: 3
+  readonly property int taliaMascotWeatherDay: 1
+
+  readonly property bool taliaWeatherMascotDayActive: {
+    const d = Time.now;
+    return d.getMonth() === root.taliaMascotWeatherMonth && d.getDate() === root.taliaMascotWeatherDay;
+  }
+
+  readonly property bool taliaWeatherMascotActive: taliaWeatherMascotDayActive || Settings.data.location.weatherTaliaMascotAlways
 
   readonly property alias data: adapter
 
@@ -61,6 +72,16 @@ Singleton {
     return `${lat}, ${lon}`;
   }
 
+  // Auto-geolocate timer - periodically updates location via IP geolocation
+  Timer {
+    id: autoLocateTimer
+    interval: 30 * 60 * 1000
+    running: Settings.data.location.autoLocate
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.geolocateAndApply()
+  }
+
   // Update timer runs when weather is enabled or location-based scheduling is active
   Timer {
     id: updateTimer
@@ -96,6 +117,7 @@ Singleton {
     adapter.name = "";
     adapter.weatherLastFetch = 0;
     adapter.weather = null;
+    isFetchingWeather = false;
     update();
   }
 
@@ -118,7 +140,6 @@ Singleton {
     }
 
     if (isFetchingWeather) {
-      Logger.w("Location", "Location update already in progress");
       return;
     }
 
@@ -130,8 +151,6 @@ Singleton {
     }
 
     geocodeLocation(Settings.data.location.name, function (latitude, longitude, name, country) {
-      Logger.d("Location", "Geocoded", Settings.data.location.name, "to:", latitude, "/", longitude);
-
       adapter.name = Settings.data.location.name;
       adapter.latitude = latitude.toString();
       adapter.longitude = longitude.toString();
@@ -141,7 +160,7 @@ Singleton {
       root.coordinatesReady = true;
 
       isFetchingWeather = false;
-      Logger.i("Location", "Coordinates ready");
+      Logger.i("Location", `Geocoded ${Settings.data.location.name}: ${root.stableLatitude}, ${root.stableLongitude}`);
 
       if (locationChanged) {
         adapter.weatherLastFetch = 0;
@@ -157,7 +176,6 @@ Singleton {
     }
 
     if (isFetchingWeather) {
-      Logger.w("Location", "Weather is still fetching");
       return;
     }
 
@@ -175,6 +193,11 @@ Singleton {
 
   // Query geocoding API to convert location name to coordinates
   function geocodeLocation(locationName, callback, errorCallback) {
+    if (locationName === "") {
+      isFetchingWeather = false;
+      return;
+    }
+
     Logger.d("Location", "Geocoding location name");
     var geoUrl = "https://api.noctalia.dev/geocode?city=" + encodeURIComponent(locationName);
     var xhr = new XMLHttpRequest();
@@ -192,7 +215,7 @@ Singleton {
             errorCallback("Location", "Failed to parse geocoding data: " + e);
           }
         } else {
-          errorCallback("Location", "Geocoding error: " + xhr.status);
+          errorCallback("Location", `Geocoding error: ${xhr.status} ${xhr.responseText}`);
         }
       }
     };
@@ -227,7 +250,7 @@ Singleton {
             errorCallback("Location", "Failed to parse weather data");
           }
         } else {
-          errorCallback("Location", "Weather fetch error: " + xhr.status);
+          errorCallback("Location", `Weather error: ${xhr.status} ${xhr.responseText}`);
         }
       }
     };
@@ -235,9 +258,66 @@ Singleton {
     xhr.send();
   }
 
+  // Geolocate via IP address using the Noctalia API
+  function geolocate(callback, errorCallback) {
+    Logger.d("Location", "Geolocating via IP");
+    var url = "https://api.noctalia.dev/geolocate";
+    var xhr = new XMLHttpRequest();
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === XMLHttpRequest.DONE) {
+        if (xhr.status === 200) {
+          try {
+            var data = JSON.parse(xhr.responseText);
+            if (data.lat != null) {
+              callback(data.lat, data.lng, data.city, data.country);
+            } else {
+              errorCallback("Location", "Geolocate: no coordinates returned");
+            }
+          } catch (e) {
+            errorCallback("Location", "Failed to parse geolocate data: " + e);
+          }
+        } else {
+          errorCallback("Location", `Geolocate error: ${xhr.status} ${xhr.responseText}`);
+        }
+      }
+    };
+    xhr.open("GET", url);
+    xhr.send();
+  }
+
+  // Geolocate via IP and apply the result as the current location
+  function geolocateAndApply() {
+    if (isFetchingWeather) {
+      Logger.w("Location", "Geolocate skipped, fetch already in progress");
+      return;
+    }
+    geolocate(function (lat, lng, city, country) {
+      Logger.i("Location", "Geolocated to", city + ",", country + ":", lat + "," + lng);
+
+      const locationChanged = adapter.name !== city;
+      Settings.data.location.name = city;
+      adapter.name = city;
+      adapter.latitude = lat.toString();
+      adapter.longitude = lng.toString();
+      root.stableLatitude = adapter.latitude;
+      root.stableLongitude = adapter.longitude;
+      root.stableName = `${city}, ${country}`;
+      root.coordinatesReady = true;
+
+      if (locationChanged) {
+        adapter.weatherLastFetch = 0;
+        adapter.weather = null;
+      }
+
+      if (Settings.data.location.weatherEnabled) {
+        updateWeatherData();
+      }
+    }, errorCallback);
+  }
+
   // --------------------------------
   function errorCallback(module, message) {
-    Logger.e(module, message);
+    Logger.w(module, message);
     isFetchingWeather = false;
   }
 
@@ -264,6 +344,22 @@ Singleton {
     if (code >= 95 && code <= 99)
       return "weather-cloud-lightning";
     return "weather-cloud";
+  }
+
+  // --------------------------------
+  function taliaWeatherImageFromCode(code, isDay) {
+    if (code >= 40 && code <= 49)
+      return Quickshell.shellDir + "/Assets/Talia/TaliaDazed.png";
+    if (code >= 95 && code <= 99)
+      return Quickshell.shellDir + "/Assets/Talia/TaliaFear.png";
+    var wet = (code >= 51 && code <= 67) || (code >= 80 && code <= 82) || (code >= 71 && code <= 77) || (code >= 85 && code <= 86);
+    if (wet)
+      return Quickshell.shellDir + "/Assets/Talia/TaliaSob.png";
+    if ((code === 0 || code === 1 || code === 2) && isDay === false)
+      return Quickshell.shellDir + "/Assets/Talia/TaliaVampire.png";
+    if ((code === 0 && isDay === true) || code === 1 || code === 2)
+      return Quickshell.shellDir + "/Assets/Talia/TaliaParty.png";
+    return Quickshell.shellDir + "/Assets/Talia/TaliaBlank.png";
   }
 
   // --------------------------------
